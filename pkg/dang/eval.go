@@ -1754,6 +1754,13 @@ type Object struct {
 	Parent       *Object                 // For hierarchical scoping
 	IsForked     bool                    // Sealed scopes keep Update local (no walk into Parent)
 	dynamicScope *DynamicScope           // Shared cell for 'self' in this scope
+
+	// generation marks a copy-on-write generation of an object value — a
+	// method call's forked receiver (forkReceiver) or the copy a field write
+	// through self makes (deriveGeneration) — as opposed to a lexical scope
+	// layer. forkReceiver compacts runs of generations so receiver chains
+	// stay shallow however deep a method recurses.
+	generation bool
 }
 
 // NewObject creates a new Object with an empty values map
@@ -1970,6 +1977,92 @@ func (m *Object) Derive(sealed bool) ValueScope {
 	}
 }
 
+// deriveGeneration derives the copy-on-write generation that a field write
+// through an object value (`self.x = v`, `obj.a.b = v`) binds its new value
+// on. It is Derive(false), additionally marked as a generation so that a
+// later method call on the result can compact it (see forkReceiver).
+func deriveGeneration(v ValueScope) ValueScope {
+	derived := v.Derive(false)
+	if obj, ok := derived.(*Object); ok {
+		obj.generation = true
+	}
+	return derived
+}
+
+// forkReceiver forks recv into the sealed copy-on-write generation a method
+// call runs against, so field writes in the body stay isolated from the
+// caller's value.
+func forkReceiver(recv ValueScope) ValueScope {
+	if obj, ok := recv.(*Object); ok {
+		return obj.forkGeneration()
+	}
+	return recv.Derive(true)
+}
+
+// forkGeneration returns a sealed generation layered on m, compacted: rather
+// than stacking on m, it copies the bindings of the run of generations from
+// m down to the first non-generation layer (the instance itself, or another
+// scope) and parents onto that base. A self-recursive method forks the fork
+// it was called on, so stacking would add a layer per call and make every
+// lookup of a name living on the instance walk the whole recursion: quadratic
+// time, and memory linear in depth. Compacted, the chain stays at most a
+// fork, its derived scopes and the base, however deep the recursion goes;
+// each call copies only the fields written since the base, never the base's
+// own bindings.
+//
+// The fork resolves every name exactly as a fork stacked on m would at the
+// time of the call. It is a snapshot of the compacted layers rather than a
+// view of them, so writes those layers take later — the caller's own bare
+// field writes after the call returns — no longer show through a fork that
+// escaped the call (e.g. a method returning self), which is what
+// copy-on-write promises anyway.
+func (m *Object) forkGeneration() *Object {
+	fork := &Object{
+		Mod:          m.Mod,
+		Values:       make(map[string]Value),
+		Visibilities: make(map[string]Visibility),
+		IsForked:     true,
+		dynamicScope: m.dynamicScope, // Share cell so closures see mutations
+		generation:   true,
+	}
+	base := m
+	for base != nil && base.generation {
+		base.mu.Lock()
+		// Nearer layers shadow farther ones. Within one layer a pending
+		// initializer takes precedence over a value (as in Lookup), so a
+		// pending only counts if no nearer layer bound the name at all; a
+		// value is kept regardless, for lookupValue, which ignores pendings.
+		for name, p := range base.Pending {
+			if _, shadowed := fork.Values[name]; shadowed {
+				continue
+			}
+			if _, shadowed := fork.Pending[name]; shadowed {
+				continue
+			}
+			if fork.Pending == nil {
+				fork.Pending = make(map[string]*pendingInit)
+			}
+			// Sharing the pendingInit means it still runs at most once.
+			fork.Pending[name] = p
+		}
+		for name, val := range base.Values {
+			if _, shadowed := fork.Values[name]; !shadowed {
+				fork.Values[name] = val
+			}
+		}
+		for name, vis := range base.Visibilities {
+			if _, shadowed := fork.Visibilities[name]; !shadowed {
+				fork.Visibilities[name] = vis
+			}
+		}
+		parent := base.Parent
+		base.mu.Unlock()
+		base = parent
+	}
+	fork.Parent = base
+	return fork
+}
+
 // Update overwrites the nearest existing binding following proper scoping rules:
 // - If the variable exists locally, update it locally
 // - If the variable doesn't exist locally but exists in parent, update parent (unless forked)
@@ -2080,7 +2173,7 @@ func (b BoundMethod) Call(ctx context.Context, scope ValueScope, args map[string
 	}
 
 	// Create a composite environment that includes both the receiver and the method's closure
-	recv := b.Receiver.Derive(true)
+	recv := forkReceiver(b.Receiver)
 	fnScope := CreateOverlayValueScope(recv.Derive(false), b.Method.Closure)
 	fnScope.EnterSelf(recv)
 

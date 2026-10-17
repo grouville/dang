@@ -590,7 +590,7 @@ func (r *Reassignment) evalFieldAssignment(ctx context.Context, scope ValueScope
 	}
 
 	// Clone the root object to begin the copy-on-write process
-	newRoot := rootObj.(ValueScope).Derive(false)
+	newRoot := deriveGeneration(rootObj.(ValueScope))
 
 	// Traverse the path, cloning objects as we go
 	currentObj := newRoot
@@ -603,7 +603,7 @@ func (r *Reassignment) evalFieldAssignment(ctx context.Context, scope ValueScope
 		if !found {
 			return nil, fmt.Errorf("field %q not found in object", fieldName)
 		}
-		clonedVal := val.(ValueScope).Derive(false)
+		clonedVal := deriveGeneration(val.(ValueScope))
 		currentObj.Bind(fieldName, clonedVal.(Value), currentObj.Visibility(fieldName))
 		currentObj = clonedVal
 	}
