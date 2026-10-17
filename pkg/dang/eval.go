@@ -1774,35 +1774,40 @@ func (m *Object) String() string {
 	return fmt.Sprintf("module %s", m.Mod)
 }
 
+// The Parent-chain walks below (Lookup, Has, lookupValue, Visibility,
+// Bindings, Update, Self) are loops rather than recursion so that a deep chain
+// costs heap, not Go stack. Each layer is locked on its own, one at a time
+// (child before parent, never both at once).
+
 func (m *Object) Lookup(ctx context.Context, name string) (Value, bool, error) {
-	m.mu.Lock()
-	p, pending := m.Pending[name]
-	val, hasVal := m.Values[name]
-	parent := m.Parent
-	m.mu.Unlock()
-	if pending {
-		return m.force(ctx, name, p)
-	}
-	if hasVal {
-		return val, true, nil
-	}
-	if parent != nil {
-		return parent.Lookup(ctx, name)
+	for o := m; o != nil; {
+		o.mu.Lock()
+		p, pending := o.Pending[name]
+		val, hasVal := o.Values[name]
+		parent := o.Parent
+		o.mu.Unlock()
+		if pending {
+			return o.force(ctx, name, p)
+		}
+		if hasVal {
+			return val, true, nil
+		}
+		o = parent
 	}
 	return nil, false, nil
 }
 
 func (m *Object) Has(name string) bool {
-	m.mu.Lock()
-	_, pending := m.Pending[name]
-	_, hasVal := m.Values[name]
-	parent := m.Parent
-	m.mu.Unlock()
-	if pending || hasVal {
-		return true
-	}
-	if parent != nil {
-		return parent.Has(name)
+	for o := m; o != nil; {
+		o.mu.Lock()
+		_, pending := o.Pending[name]
+		_, hasVal := o.Values[name]
+		parent := o.Parent
+		o.mu.Unlock()
+		if pending || hasVal {
+			return true
+		}
+		o = parent
 	}
 	return false
 }
@@ -1878,15 +1883,15 @@ func (m *Object) LookupLocal(name string) (Value, bool) {
 // initializers). Use this only when pending has already been forced —
 // otherwise Lookup is the right call.
 func (m *Object) lookupValue(name string) (Value, bool) {
-	m.mu.Lock()
-	val, ok := m.Values[name]
-	parent := m.Parent
-	m.mu.Unlock()
-	if ok {
-		return val, true
-	}
-	if parent != nil {
-		return parent.lookupValue(name)
+	for o := m; o != nil; {
+		o.mu.Lock()
+		val, ok := o.Values[name]
+		parent := o.Parent
+		o.mu.Unlock()
+		if ok {
+			return val, true
+		}
+		o = parent
 	}
 	return nil, false
 }
@@ -1899,15 +1904,15 @@ func (m *Object) Bind(name string, value Value, visibility Visibility) {
 }
 
 func (m *Object) Visibility(name string) Visibility {
-	m.mu.Lock()
-	vis, ok := m.Visibilities[name]
-	parent := m.Parent
-	m.mu.Unlock()
-	if ok {
-		return vis
-	}
-	if parent != nil {
-		return parent.Visibility(name)
+	for o := m; o != nil; {
+		o.mu.Lock()
+		vis, ok := o.Visibilities[name]
+		parent := o.Parent
+		o.mu.Unlock()
+		if ok {
+			return vis
+		}
+		o = parent
 	}
 	return PrivateVisibility
 }
@@ -1928,31 +1933,27 @@ func (m *Object) visibilityLocked(name string) Visibility {
 func (m *Object) Bindings(vis Visibility) []Keyed[Value] {
 	var bindings []Keyed[Value]
 
-	m.mu.Lock()
-	// Collect bindings from this module, recording every local key so parent
-	// bindings it shadows can be filtered out below.
-	shadowed := make(map[string]struct{}, len(m.Values))
-	for name, value := range m.Values {
-		shadowed[name] = struct{}{}
-		if m.Visibilities[name] >= vis {
-			bindings = append(bindings, Keyed[Value]{
-				Key:        name,
-				Value:      value,
-				Positional: false, // Type bindings are never positional
-			})
-		}
-	}
-	parent := m.Parent
-	m.mu.Unlock()
-
-	// Collect bindings from parent (if any) - avoiding duplicates
-	if parent != nil {
-		for _, binding := range parent.Bindings(vis) {
-			// Only include if not shadowed by current module
-			if _, isShadowed := shadowed[binding.Key]; !isShadowed {
-				bindings = append(bindings, binding)
+	// Collect bindings layer by layer, nearest first, recording every key seen
+	// so bindings it shadows further up the chain are filtered out.
+	shadowed := map[string]struct{}{}
+	for o := m; o != nil; {
+		o.mu.Lock()
+		for name, value := range o.Values {
+			if _, isShadowed := shadowed[name]; isShadowed {
+				continue
+			}
+			shadowed[name] = struct{}{}
+			if o.Visibilities[name] >= vis {
+				bindings = append(bindings, Keyed[Value]{
+					Key:        name,
+					Value:      value,
+					Positional: false, // Type bindings are never positional
+				})
 			}
 		}
+		parent := o.Parent
+		o.mu.Unlock()
+		o = parent
 	}
 
 	return bindings
@@ -1974,39 +1975,48 @@ func (m *Object) Derive(sealed bool) ValueScope {
 // - If the variable doesn't exist locally but exists in parent, update parent (unless forked)
 // - If the variable doesn't exist anywhere, set it locally
 func (m *Object) Update(name string, value Value) {
-	m.mu.Lock()
-	if _, existsLocally := m.Values[name]; existsLocally {
-		// Variable exists locally, update it locally
-		m.Values[name] = value
-		m.Visibilities[name] = m.visibilityLocked(name)
-		m.mu.Unlock()
+	// inChain records that o's own chain is known to bind name (the previous
+	// step's parent.Has check), sparing a full re-walk at every step.
+	inChain := false
+	for o := m; ; {
+		o.mu.Lock()
+		if _, existsLocally := o.Values[name]; existsLocally {
+			// Variable exists locally, update it locally
+			o.Values[name] = value
+			o.Visibilities[name] = o.visibilityLocked(name)
+			o.mu.Unlock()
+			return
+		}
+		_, pendingLocally := o.Pending[name]
+		parent := o.Parent
+		forked := o.IsForked
+		o.mu.Unlock()
+
+		// Variable exists in parent: update parent (only if not forked). If o's
+		// chain binds name but o holds neither a value nor a pending
+		// initializer for it, the binding must be in the parent's chain.
+		if parent != nil && !forked && ((inChain && !pendingLocally) || parent.Has(name)) {
+			o = parent
+			inChain = true
+			continue
+		}
+
+		// Variable doesn't exist anywhere (or we're a forked boundary): set it
+		// locally.
+		o.mu.Lock()
+		o.Values[name] = value
+		o.Visibilities[name] = o.visibilityLocked(name)
+		o.mu.Unlock()
 		return
 	}
-	parent := m.Parent
-	forked := m.IsForked
-	m.mu.Unlock()
-
-	if parent != nil && !forked && parent.Has(name) {
-		// Variable exists in parent, update parent (only if not forked)
-		parent.Update(name, value)
-		return
-	}
-
-	// Variable doesn't exist anywhere (or we're a forked boundary): set it
-	// locally.
-	m.mu.Lock()
-	m.Values[name] = value
-	m.Visibilities[name] = m.visibilityLocked(name)
-	m.mu.Unlock()
 }
 
 // Self returns the dynamic scope value ('self')
 func (m *Object) Self() (Value, bool) {
-	if m.dynamicScope != nil && m.dynamicScope.Value != nil {
-		return m.dynamicScope.Value, true
-	}
-	if m.Parent != nil {
-		return m.Parent.Self()
+	for o := m; o != nil; o = o.Parent {
+		if o.dynamicScope != nil && o.dynamicScope.Value != nil {
+			return o.dynamicScope.Value, true
+		}
 	}
 	return nil, false
 }
