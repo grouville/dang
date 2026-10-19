@@ -2924,7 +2924,7 @@ func evaluateDirectoryFiles(ctx context.Context, blocks []*FileBlock, valueScope
 
 // EvalNode evaluates any AST node (legacy interface)
 func EvalNode(ctx context.Context, scope ValueScope, node Node) (Value, error) {
-	return EvalNodeWithContext(ctx, scope, node, GetEvalContext(ctx))
+	return evalNode(ctx, scope, node, nil, true)
 }
 
 // EvalNodeWithContext evaluates any AST node with enhanced error reporting
@@ -2934,6 +2934,12 @@ func EvalNodeWithContext(ctx context.Context, scope ValueScope, node Node, evalC
 		ctx = WithEvalContext(ctx, evalCtx)
 	}
 
+	return evalNode(ctx, scope, node, evalCtx, false)
+}
+
+// evalNode reads inherited source context only when an error needs it. The
+// explicit context API preserves its nil argument's existing wrapping behavior.
+func evalNode(ctx context.Context, scope ValueScope, node Node, evalCtx *EvalContext, lookupErrorContext bool) (Value, error) {
 	if evaluator, ok := node.(Evaluator); ok {
 		val, err := evaluator.Eval(ctx, scope)
 		if err != nil {
@@ -2942,6 +2948,9 @@ func EvalNodeWithContext(ctx context.Context, scope ValueScope, node Node, evalC
 			var raised *RaisedError
 			if errors.As(err, &raised) || isControlFlowException(err) {
 				return nil, err
+			}
+			if lookupErrorContext {
+				evalCtx = GetEvalContext(ctx)
 			}
 			if evalCtx != nil {
 				return nil, evalCtx.CreateSourceError(err, node)
@@ -2967,6 +2976,9 @@ func EvalNodeWithContext(ctx context.Context, scope ValueScope, node Node, evalC
 		return NullValue{}, nil
 	default:
 		err := fmt.Errorf("evaluation not implemented for node type %T", node)
+		if lookupErrorContext {
+			evalCtx = GetEvalContext(ctx)
+		}
 		if evalCtx != nil {
 			return nil, evalCtx.CreateSourceError(err, node)
 		}
