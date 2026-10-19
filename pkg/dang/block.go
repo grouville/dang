@@ -118,7 +118,7 @@ func classifyForms(forms []Node) ClassifiedForms {
 		case *FieldDecl:
 			if isConstantValue(f.Value) {
 				classified.Constants = append(classified.Constants, f)
-			} else if _, isFunDecl := f.Value.(*FunDecl); isFunDecl {
+			} else if isFunctionDeclaration(f.Value) {
 				// Treat FieldDecl with function bodies as functions for proper hoisting
 				classified.Functions = append(classified.Functions, f)
 			} else {
@@ -133,6 +133,20 @@ func classifyForms(forms []Node) ClassifiedForms {
 	}
 
 	return classified
+}
+
+// Type inference wraps annotated method values in Coerce. Classification must
+// still recognize the declaration; evaluation retains the conversion wrapper.
+func isFunctionDeclaration(value Node) bool {
+	for {
+		conversion, ok := value.(*Coerce)
+		if !ok {
+			break
+		}
+		value = conversion.Expr
+	}
+	_, ok := value.(*FunDecl)
+	return ok
 }
 
 // DeclareFormsWithPhases performs the declaration/signature half of phased
