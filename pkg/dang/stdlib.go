@@ -1177,6 +1177,10 @@ func registerStdlib() {
 		})
 }
 
+// Concrete Dang functions only read this synthetic caller's self. Their
+// arguments and locals live in a fresh scope derived from their closure.
+var callbackCallerScope = NewObject(NewType("_temp_", ObjectKind))
+
 // callFunc calls a function with the given values as arguments.
 // The values are mapped to the function's parameters in order.
 func callFunc(ctx context.Context, fn Value, args ...Value) (Value, error) {
@@ -1195,5 +1199,10 @@ func callFunc(ctx context.Context, fn Value, args ...Value) (Value, error) {
 		callArgs[paramNames[i]] = arg
 	}
 
+	switch callable.(type) {
+	case FunctionValue, *FunctionValue:
+		return callable.Call(ctx, callbackCallerScope, callArgs)
+	}
+	// Other Callable implementations may mutate their caller.
 	return callable.Call(ctx, NewObject(NewType("_temp_", ObjectKind)), callArgs)
 }
