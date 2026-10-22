@@ -59,7 +59,7 @@ func TestParseBlueprintFreshSyntax(t *testing.T) {
 
 func TestBlueprintCacheBudget(t *testing.T) {
 	cache := newSyntaxCache(4, 10)
-	create := func(reflect.Value) reflect.Value { return reflect.ValueOf(1) }
+	create := parseBlueprint{syntax: reflect.ValueOf(1)}
 	one, two, three := parseBlueprintKey{digest: [32]byte{1}}, parseBlueprintKey{digest: [32]byte{2}}, parseBlueprintKey{digest: [32]byte{3}}
 	cache.add(one, create, 4)
 	cache.add(two, create, 4)

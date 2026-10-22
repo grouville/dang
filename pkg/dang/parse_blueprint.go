@@ -14,32 +14,30 @@ import (
 	"github.com/hashicorp/golang-lru/v2/simplelru"
 )
 
-// A parse blueprint retains syntax before inference, never a module's schema,
+// The cache retains a parsed tree before inference, never a module's schema,
 // client or values. Each use constructs independent pointers and containers
 // and supplies the current file path for source locations.
-type parseBlueprint func(filename reflect.Value) reflect.Value
+type parseBlueprint struct {
+	syntax   reflect.Value
+	pointers int
+}
 
-type syntaxCloner func(*syntaxCloneState) reflect.Value
+func (template parseBlueprint) copy(filename reflect.Value) (reflect.Value, error) {
+	copied, _, err := copySyntax(template.syntax, filename, nil, 0, template.pointers)
+	return copied, err
+}
 
-type syntaxCloneState struct {
+type syntaxCopyState struct {
 	filename reflect.Value
-	pointers []reflect.Value
-}
-
-type syntaxPointer struct {
-	typ     reflect.Type
-	address uintptr
-}
-
-type syntaxBlueprintBuilder struct {
-	weight    *int64
-	budget    int64
-	pointers  map[syntaxPointer]int
-	sliceCaps map[syntaxPointer]int
-	regions   []syntaxRegion
+	copies   map[uintptr]reflect.Value
+	regions  []syntaxRegion
+	weight   *int64
+	budget   int64
 }
 
 type syntaxRegion struct{ start, end uintptr }
+
+var syntaxFilenameField, _ = reflect.TypeFor[SourceLocation]().FieldByName("Filename")
 
 type parseBlueprintKey struct {
 	digest [32]byte
@@ -115,7 +113,10 @@ func parseFileBlueprintWithCache(filename string, cache *SyntaxCache) (any, erro
 	}
 	key := parseBlueprintKey{digest: sha256.Sum256(source)}
 	if blueprint, ok := cache.get(key); ok {
-		return blueprint(reflect.ValueOf(filename)).Interface().(*FileBlock), nil
+		copied, err := blueprint.copy(reflect.ValueOf(filename))
+		if err == nil {
+			return copied.Interface().(*FileBlock), nil
+		}
 	}
 	parsed, err := ParseWithRecovery(filename, source, GlobalStore("filePath", filename))
 	if err != nil {
@@ -128,8 +129,8 @@ func parseFileBlueprintWithCache(filename string, cache *SyntaxCache) (any, erro
 	weight := int64(128) // key and LRU entry
 	blueprint, err := syntaxBlueprintWeighted(reflect.ValueOf(block), &weight, cache.budget)
 	if err != nil {
-		// New syntax fields must preserve parsing even before the blueprint
-		// builder supports them. This result has not been inferred yet.
+		// Unsupported fields fall back to normal parsing. This result has
+		// not been inferred yet and belongs only to the current call.
 		return block, nil
 	}
 	cache.add(key, blueprint, weight)
@@ -142,167 +143,131 @@ func syntaxBlueprint(value reflect.Value) (parseBlueprint, error) {
 }
 
 func syntaxBlueprintWeighted(value reflect.Value, weight *int64, budget int64) (parseBlueprint, error) {
-	builder := syntaxBlueprintBuilder{weight: weight, budget: budget, pointers: map[syntaxPointer]int{}, sliceCaps: map[syntaxPointer]int{}}
-	create, err := builder.build(value)
+	template, pointerCount, err := copySyntax(value, reflect.Value{}, weight, budget, 0)
 	if err != nil {
-		return nil, err
+		return parseBlueprint{}, err
 	}
-	// Identical references share one clone. Other overlapping storage,
-	// including pointers into another object, requires normal parsing.
-	slices.SortFunc(builder.regions, func(a, b syntaxRegion) int { return cmp.Compare(a.start, b.start) })
-	for i := 1; i < len(builder.regions); i++ {
-		if builder.regions[i].start < builder.regions[i-1].end {
-			return nil, fmt.Errorf("overlapping syntax storage")
-		}
-	}
-	count := len(builder.pointers)
-	return func(filename reflect.Value) reflect.Value {
-		state := syntaxCloneState{filename: filename, pointers: make([]reflect.Value, count)}
-		return create(&state)
-	}, nil
+	return parseBlueprint{syntax: template, pointers: pointerCount}, nil
 }
 
-func (builder *syntaxBlueprintBuilder) build(value reflect.Value) (syntaxCloner, error) {
-	// Account for a closure, reflected scalar/type metadata and child storage.
-	// This is a cache weight, not exact allocator heap accounting.
-	*builder.weight += 128
-	if *builder.weight > builder.budget {
-		return nil, fmt.Errorf("parse blueprint exceeds cache budget")
+// The cached template is never returned to a caller. Validate its storage and
+// detach strings once; later calls only copy it and supply their source path.
+func copySyntax(value, filename reflect.Value, weight *int64, budget int64, pointerCount int) (reflect.Value, int, error) {
+	state := syntaxCopyState{filename: filename, copies: make(map[uintptr]reflect.Value, pointerCount), weight: weight, budget: budget}
+	result := reflect.New(value.Type()).Elem()
+	if err := state.copyInto(result, value); err != nil {
+		return reflect.Value{}, 0, err
 	}
-	typeOf := value.Type()
+	slices.SortFunc(state.regions, func(a, b syntaxRegion) int { return cmp.Compare(a.start, b.start) })
+	for i := 1; i < len(state.regions); i++ {
+		if state.regions[i].start < state.regions[i-1].end {
+			return reflect.Value{}, 0, fmt.Errorf("overlapping syntax storage")
+		}
+	}
+	return result, len(state.copies), nil
+}
+
+func (state *syntaxCopyState) charge(amount int64) error {
+	if state.weight != nil {
+		*state.weight += amount
+		if *state.weight > state.budget {
+			return fmt.Errorf("parse blueprint exceeds cache budget")
+		}
+	}
+	return nil
+}
+
+func (state *syntaxCopyState) remember(value, result reflect.Value, size uintptr) {
+	state.copies[value.Pointer()] = result
+	if state.weight != nil && size > 0 {
+		state.regions = append(state.regions, syntaxRegion{value.Pointer(), value.Pointer() + size})
+	}
+}
+
+func (state *syntaxCopyState) copyInto(result, value reflect.Value) error {
+	if err := state.charge(128); err != nil {
+		return err
+	}
 	if value.IsZero() {
-		return func(state *syntaxCloneState) reflect.Value { return reflect.Zero(typeOf) }, nil
+		return nil
 	}
+	typ := value.Type()
 	switch value.Kind() {
 	case reflect.Pointer:
-		key := syntaxPointer{typ: typeOf, address: value.Pointer()}
-		if id, ok := builder.pointers[key]; ok {
-			return func(state *syntaxCloneState) reflect.Value { return state.pointers[id] }, nil
+		if copied, ok := state.copies[value.Pointer()]; ok {
+			if copied.Type() != typ {
+				return fmt.Errorf("overlapping syntax pointer types")
+			}
+			result.Set(copied)
+			return nil
 		}
-		id := len(builder.pointers)
-		builder.pointers[key] = id
-		if size := typeOf.Elem().Size(); size > 0 {
-			builder.regions = append(builder.regions, syntaxRegion{key.address, key.address + size})
-		}
-		element, err := builder.build(value.Elem())
-		if err != nil {
-			return nil, err
-		}
-		return func(state *syntaxCloneState) reflect.Value {
-			result := reflect.New(typeOf.Elem())
-			state.pointers[id] = result
-			result.Elem().Set(element(state))
-			return result
-		}, nil
+		result.Set(reflect.New(typ.Elem()))
+		state.remember(value, result, typ.Elem().Size())
+		return state.copyInto(result.Elem(), value.Elem())
 	case reflect.Interface:
-		element, err := builder.build(value.Elem())
-		if err != nil {
-			return nil, err
+		concrete := reflect.New(value.Elem().Type()).Elem()
+		if err := state.copyInto(concrete, value.Elem()); err != nil {
+			return err
 		}
-		return func(state *syntaxCloneState) reflect.Value {
-			result := reflect.New(typeOf).Elem()
-			result.Set(element(state))
-			return result
-		}, nil
+		result.Set(concrete)
 	case reflect.Struct:
-		*builder.weight += int64(value.NumField()) * 8
-		if *builder.weight > builder.budget {
-			return nil, fmt.Errorf("parse blueprint exceeds cache budget")
-		}
-		fields := make([]syntaxCloner, value.NumField())
-		for i := range fields {
-			field := typeOf.Field(i)
-			if field.PkgPath != "" {
+		for i := 0; i < value.NumField(); i++ {
+			if !result.Field(i).CanSet() {
 				if !value.Field(i).IsZero() {
-					return nil, fmt.Errorf("nonzero private parse field %s.%s", typeOf, field.Name)
+					return fmt.Errorf("nonzero private parse field %s.%s", typ, typ.Field(i).Name)
 				}
 				continue
 			}
-			if typeOf == reflect.TypeFor[SourceLocation]() && field.Name == "Filename" {
-				// Source paths belong to this use of the syntax, not its content.
-				fields[i] = func(state *syntaxCloneState) reflect.Value { return state.filename }
-				continue
-			}
-			var err error
-			fields[i], err = builder.build(value.Field(i))
-			if err != nil {
-				return nil, err
+			if typ == reflect.TypeFor[SourceLocation]() && i == syntaxFilenameField.Index[0] && state.filename.IsValid() {
+				result.Field(i).Set(state.filename)
+			} else if err := state.copyInto(result.Field(i), value.Field(i)); err != nil {
+				return err
 			}
 		}
-		return func(state *syntaxCloneState) reflect.Value {
-			result := reflect.New(typeOf).Elem()
-			for i, field := range fields {
-				if field != nil {
-					result.Field(i).Set(field(state))
-				}
-			}
-			return result
-		}, nil
 	case reflect.Slice:
 		length, capacity := value.Len(), value.Cap()
-		id := -1
-		if capacity > 0 && typeOf.Elem().Size() > 0 {
-			key := syntaxPointer{typ: typeOf, address: value.Pointer()}
-			if found, ok := builder.pointers[key]; ok {
-				if builder.sliceCaps[key] != capacity {
-					return nil, fmt.Errorf("overlapping syntax slice capacities")
+		if capacity > 0 && typ.Elem().Size() > 0 {
+			if copied, ok := state.copies[value.Pointer()]; ok {
+				if copied.Type() != typ || copied.Cap() != capacity {
+					return fmt.Errorf("overlapping syntax slice capacities")
 				}
-				return func(state *syntaxCloneState) reflect.Value {
-					return state.pointers[found].Slice3(0, length, capacity)
-				}, nil
-			}
-			id = len(builder.pointers)
-			builder.pointers[key] = id
-			builder.sliceCaps[key] = capacity
-			builder.regions = append(builder.regions, syntaxRegion{key.address, key.address + uintptr(capacity)*typeOf.Elem().Size()})
-		}
-		*builder.weight += int64(capacity) * 8
-		if *builder.weight > builder.budget {
-			return nil, fmt.Errorf("parse blueprint exceeds cache budget")
-		}
-		elements := make([]syntaxCloner, capacity)
-		full := value.Slice(0, capacity)
-		for i := range elements {
-			var err error
-			elements[i], err = builder.build(full.Index(i))
-			if err != nil {
-				return nil, err
+				result.Set(copied.Slice3(0, length, capacity))
+				return nil
 			}
 		}
-		return func(state *syntaxCloneState) reflect.Value {
-			result := reflect.MakeSlice(typeOf, capacity, capacity)
-			if id >= 0 {
-				state.pointers[id] = result
+		if err := state.charge(int64(capacity) * 8); err != nil {
+			return err
+		}
+		full := reflect.MakeSlice(typ, capacity, capacity)
+		result.Set(full.Slice3(0, length, capacity))
+		if capacity > 0 && typ.Elem().Size() > 0 {
+			state.remember(value, full, uintptr(capacity)*typ.Elem().Size())
+		}
+		source := value.Slice(0, capacity)
+		for i := range capacity {
+			if err := state.copyInto(full.Index(i), source.Index(i)); err != nil {
+				return err
 			}
-			for i, element := range elements {
-				result.Index(i).Set(element(state))
-			}
-			return result.Slice3(0, length, capacity)
-		}, nil
+		}
 	case reflect.Func:
-		// Parser-installed operator evaluators are immutable functions; the
-		// blueprint is built before inference or evaluation can bind clients.
-		if typeOf != reflect.TypeFor[BinaryOperatorEvaluator]() {
-			return nil, fmt.Errorf("unsupported parse function %s", typeOf)
+		if typ != reflect.TypeFor[BinaryOperatorEvaluator]() {
+			return fmt.Errorf("unsupported parse function %s", typ)
 		}
-		function := reflect.New(typeOf).Elem()
-		function.Set(value)
-		return func(state *syntaxCloneState) reflect.Value { return function }, nil
-	case reflect.String, reflect.Bool, reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64,
+		result.Set(value)
+	case reflect.String:
+		if err := state.charge(int64(value.Len())); err != nil {
+			return err
+		}
+		if state.weight != nil {
+			result.SetString(strings.Clone(value.String()))
+		} else {
+			result.Set(value)
+		}
+	case reflect.Bool, reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64,
 		reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64, reflect.Float32, reflect.Float64:
-		// Copy scalar values into the blueprint, detached from parser storage.
-		scalar := reflect.New(typeOf).Elem()
-		scalar.Set(value)
-		if value.Kind() == reflect.String {
-			*builder.weight += int64(value.Len())
-			if *builder.weight > builder.budget {
-				return nil, fmt.Errorf("parse blueprint exceeds cache budget")
-			}
-			// Detach strings from any larger parser source buffer.
-			scalar.SetString(strings.Clone(value.String()))
-		}
-		return func(state *syntaxCloneState) reflect.Value { return scalar }, nil
+		result.Set(value)
 	default:
-		return nil, fmt.Errorf("unsupported parse field %s", typeOf)
+		return fmt.Errorf("unsupported parse field %s", typ)
 	}
+	return nil
 }

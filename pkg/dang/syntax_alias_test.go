@@ -24,8 +24,8 @@ func TestSyntaxBlueprintPreservesAliases(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	first := factory(reflect.ValueOf("one.dang")).Interface().(struct{ First, Second *NamedTypeNode })
-	second := factory(reflect.ValueOf("two.dang")).Interface().(struct{ First, Second *NamedTypeNode })
+	first := cloneSyntaxForTest(t, factory, "one.dang").Interface().(struct{ First, Second *NamedTypeNode })
+	second := cloneSyntaxForTest(t, factory, "two.dang").Interface().(struct{ First, Second *NamedTypeNode })
 	if first.First != first.Second || second.First != second.Second {
 		t.Fatal("internal alias lost")
 	}
@@ -43,8 +43,8 @@ func TestSyntaxBlueprintPreservesSliceStorage(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	first := factory(reflect.ValueOf("one.dang")).Interface().(struct{ First, Second []int })
-	second := factory(reflect.ValueOf("two.dang")).Interface().(struct{ First, Second []int })
+	first := cloneSyntaxForTest(t, factory, "one.dang").Interface().(struct{ First, Second []int })
+	second := cloneSyntaxForTest(t, factory, "two.dang").Interface().(struct{ First, Second []int })
 	first.First[0] = 9
 	if first.Second[0] != 9 {
 		t.Fatal("shared backing storage was lost")
@@ -59,4 +59,13 @@ func TestSyntaxBlueprintPreservesSliceStorage(t *testing.T) {
 	if _, err := syntaxBlueprint(reflect.ValueOf(overlapping)); err == nil {
 		t.Fatal("unsupported overlapping views accepted")
 	}
+}
+
+func cloneSyntaxForTest(t testing.TB, factory parseBlueprint, filename string) reflect.Value {
+	t.Helper()
+	value, err := factory.copy(reflect.ValueOf(filename))
+	if err != nil {
+		t.Fatal(err)
+	}
+	return value
 }
