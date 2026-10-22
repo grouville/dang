@@ -69,13 +69,15 @@ func TestParseBlueprintRelativeImportsAcrossPaths(t *testing.T) {
 }
 
 func TestParseBlueprintDiagnosticAcrossPaths(t *testing.T) {
+	cache := NewSyntaxCache()
+	ctx := WithSyntaxCache(t.Context(), cache)
 	for range 2 {
 		dir := t.TempDir()
 		filename := filepath.Join(dir, "main.dang")
 		if err := os.WriteFile(filename, []byte("answer: Int! = \"wrong\"\n"), 0600); err != nil {
 			t.Fatal(err)
 		}
-		_, err := RunDir(t.Context(), dir, false)
+		_, err := RunDir(ctx, dir, false)
 		var sourceError *SourceError
 		if !errors.As(err, &sourceError) || sourceError.Location == nil || sourceError.Location.Filename != filename {
 			t.Fatalf("diagnostic should name %s, got %v", filename, err)
@@ -83,5 +85,8 @@ func TestParseBlueprintDiagnosticAcrossPaths(t *testing.T) {
 		if err := os.Remove(filename); err != nil {
 			t.Fatal(err)
 		}
+	}
+	if got := cache.entries.Len(); got != 1 {
+		t.Fatalf("identical source retained %d entries, want 1", got)
 	}
 }
