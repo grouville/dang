@@ -1195,5 +1195,10 @@ func callFunc(ctx context.Context, fn Value, args ...Value) (Value, error) {
 		callArgs[paramNames[i]] = arg
 	}
 
+	// Blocks run in their captured scope, so there is no caller scope to supply.
+	// Avoid constructing an unused object and type for every list element.
+	if block, ok := callable.(FunctionValue); ok && block.IsBlockArg {
+		return block.Call(ctx, block.Closure, callArgs)
+	}
 	return callable.Call(ctx, NewObject(NewType("_temp_", ObjectKind)), callArgs)
 }
